@@ -82,6 +82,101 @@ async function clearBrowserDataSafely() {
 }
 
 /**
+ * Small pool of realistic desktop User-Agent strings.
+ * Can be overridden/extended via config.userAgents (array of strings).
+ */
+const defaultUserAgents = [
+  // Chrome on Windows
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+  // Chrome on macOS
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_6) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+  // Chrome on Linux
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+];
+
+/**
+ * Return a random User-Agent string.
+ * If config.userAgents is provided and non-empty, use that; otherwise fallback to defaults.
+ */
+function getRandomUserAgent() {
+  const pool =
+    config && Array.isArray(config.userAgents) && config.userAgents.length > 0
+      ? config.userAgents
+      : defaultUserAgents;
+
+  if (!pool || pool.length === 0) {
+    // Extremely defensive: should never happen, but just in case
+    return defaultUserAgents[0];
+  }
+
+  const idx = Math.floor(Math.random() * pool.length);
+  return pool[idx];
+}
+
+// (geo profile helpers are defined once below; older duplicate removed)
+
+/**
+ * Default pool of geo/location “profiles”.
+ * Each profile can be overridden/extended via config.geoProfiles (array of objects).
+ */
+const defaultGeoProfiles = [
+  {
+    country: "IN",
+    city: "Delhi",
+    acceptLanguage: "en-IN,en;q=0.9",
+    timezone: "Asia/Kolkata",
+  },
+  {
+    country: "IN",
+    city: "Bengaluru",
+    acceptLanguage: "en-IN,en;q=0.9",
+    timezone: "Asia/Kolkata",
+  },
+  {
+    country: "IN",
+    city: "Mumbai",
+    acceptLanguage: "en-IN,en;q=0.9",
+    timezone: "Asia/Kolkata",
+  },
+  {
+    country: "AE",
+    city: "Dubai",
+    acceptLanguage: "en-GB,en;q=0.9",
+    timezone: "Asia/Dubai",
+  },
+  {
+    country: "SG",
+    city: "Singapore",
+    acceptLanguage: "en-SG,en;q=0.9",
+    timezone: "Asia/Singapore",
+  },
+];
+
+/**
+ * Return a random geo/location profile.
+ * If config.geoProfiles is provided and non-empty, use that; otherwise fallback to defaults.
+ * A profile is of the form:
+ * { country: "IN", city: "Delhi", acceptLanguage: "en-IN,en;q=0.9", timezone: "Asia/Kolkata" }
+ */
+function getRandomGeoProfile() {
+  const pool =
+    config &&
+    Array.isArray(config.geoProfiles) &&
+    config.geoProfiles.length > 0
+      ? config.geoProfiles
+      : defaultGeoProfiles;
+
+  if (!pool || pool.length === 0) {
+    return defaultGeoProfiles[0];
+  }
+
+  const idx = Math.floor(Math.random() * pool.length);
+  return pool[idx];
+}
+
+/**
  * Perform some human-like interactions (scrolling, small pauses) on a tab.
  * This is intentionally lightweight and randomised to avoid looking like a bot.
  * @param {number} tabId - The ID of the tab to interact with
@@ -3021,13 +3116,15 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
 
         if (details.requestHeaders) {
           details.requestHeaders.forEach((header) => {
+            const lowerName = header.name.toLowerCase();
+
             // Store with original case for key, but also allow case-insensitive lookup
             headersObj[header.name] = header.value;
             // Also store lowercase version for easy lookup
-            headersObj[header.name.toLowerCase()] = header.value;
+            headersObj[lowerName] = header.value;
 
             // Extract cookie header
-            if (header.name.toLowerCase() === "cookie") {
+            if (lowerName === "cookie") {
               cookieHeader = header.value;
 
               // Parse cookies into individual key-value pairs
@@ -3049,7 +3146,75 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
           });
         }
 
-        // Store headers with URL as key
+        // === Dynamically adjust outgoing request headers for Makemytrip URLs ===
+        // 1) Pick a random User-Agent for THIS request
+        const randomUA = getRandomUserAgent();
+
+        // 2) Extra/dynamic headers from config, if provided
+        // You can configure these in config.json as:
+        // "dynamicRequestHeaders": { "X-My-Header": "value", ... }
+        const dynamicHeaders =
+          (config &&
+            (config.dynamicRequestHeaders ||
+              config.extraRequestHeaders ||
+              config.requestHeaders)) ||
+          {};
+
+        // Helper to upsert a header into both the array and our headersObj map
+        const upsertHeader = (name, value) => {
+          if (!details.requestHeaders) return;
+          const lowerName = name.toLowerCase();
+          let found = false;
+
+          for (const h of details.requestHeaders) {
+            if (h.name.toLowerCase() === lowerName) {
+              h.value = String(value);
+              found = true;
+              break;
+            }
+          }
+
+          if (!found) {
+            details.requestHeaders.push({ name, value: String(value) });
+          }
+
+          headersObj[name] = String(value);
+          headersObj[lowerName] = String(value);
+        };
+
+        // Apply random User-Agent header
+        if (randomUA) {
+          upsertHeader("User-Agent", randomUA);
+        }
+
+        // Apply random geo/location headers
+        const geoProfile = getRandomGeoProfile();
+        if (geoProfile) {
+          const { country, city, acceptLanguage, timezone } = geoProfile;
+
+          if (country) {
+            upsertHeader("X-Geo-Country", country);
+          }
+          if (city) {
+            upsertHeader("X-Geo-City", city);
+          }
+          if (timezone) {
+            upsertHeader("X-Geo-Timezone", timezone);
+          }
+          // Optionally override Accept-Language to match the profile
+          if (acceptLanguage) {
+            upsertHeader("Accept-Language", acceptLanguage);
+          }
+        }
+
+        // Apply additional dynamic headers from config
+        Object.entries(dynamicHeaders).forEach(([name, value]) => {
+          if (value !== undefined && value !== null && value !== "") {
+            upsertHeader(name, value);
+          }
+        });
+
+        // Store headers with URL as key (after modifications)
         const capturedData = {
           headers: headersObj,
           cookies: cookieHeader || "", // Full cookie string
@@ -3195,7 +3360,7 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
       console.error("[Background] Error stack:", error.stack);
     }
 
-    // Return unmodified headers (we're just reading, not modifying)
+    // Return (potentially) modified headers
     return { requestHeaders: details.requestHeaders };
   },
   {
@@ -3205,7 +3370,9 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
       "https://flights-cb.makemytrip.com/*",
     ],
   },
-  ["requestHeaders"], // Need to request access to requestHeaders
+  // Need to request access to requestHeaders and allow modification (blocking).
+  // Note: manifest.json must include "webRequestBlocking" permission for this to work.
+  ["requestHeaders", "blocking", "extraHeaders"],
 );
 
 /**
