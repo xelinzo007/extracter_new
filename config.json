@@ -1,0 +1,35 @@
+{
+  "sectorsApi": {
+    "baseUrl": "https://mmt-new.mfilterit.net/dev/api/sectors",
+    "type": "domestic_roundtrip",
+    "headers": {
+      "x-api-key": "NITESHABCD"
+    }
+  },
+  "api_names": {
+    "searchStreamAPI": "/search-stream-dt",
+    "searchStreamAPIFull": "flights-cb.makemytrip.com/api/search-stream-dt",
+    "apiPath": "/api/"
+  },
+  "insertApi": {
+    "url": "https://mmt-new.mfilterit.net/dev/api/insert_resp",
+    "collectionName": "roundtrip_domestic_dump",
+    "requestHeaders": {
+      "x-api-key": "NITESHABCD",
+      "Content-Type": "application/json"
+    },
+    "payloadHeaders": {
+      "x-api-key": "NITESH123",
+      "source": "extension"
+    }
+  },
+  "domain": "https://www.makemytrip.com",
+  "apiDomain": "flights-cb.makemytrip.com",
+  "cdnDomain": "mmtcdn.net",
+  "urlsBeforeClear": 10,
+  "enableScheduling": true,
+  "scheduledHour": 6,
+  "scheduledMinute": 58,
+  "maxParallelTabs": 3,
+  "targetDurationMinutes": 255
+}
