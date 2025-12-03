@@ -3360,7 +3360,10 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
       console.error("[Background] Error stack:", error.stack);
     }
 
-    // Return (potentially) modified headers
+    // NOTE: We are not using a blocking listener (no webRequestBlocking permission),
+    // so Chrome will ignore any attempt to MODIFY headers here. We still return
+    // the headers object for completeness, but in non-enterprise installs this
+    // listener effectively acts as a read-only logger.
     return { requestHeaders: details.requestHeaders };
   },
   {
@@ -3370,9 +3373,9 @@ chrome.webRequest.onBeforeSendHeaders.addListener(
       "https://flights-cb.makemytrip.com/*",
     ],
   },
-  // Need to request access to requestHeaders and allow modification (blocking).
-  // Note: manifest.json must include "webRequestBlocking" permission for this to work.
-  ["requestHeaders", "blocking", "extraHeaders"],
+  // Only "requestHeaders" is used here; we are NOT using "blocking" because
+  // webRequestBlocking is restricted to enterprise force-installed extensions.
+  ["requestHeaders"],
 );
 
 /**
