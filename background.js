@@ -81,6 +81,87 @@ async function clearBrowserDataSafely() {
   }
 }
 
+/**
+ * Perform some human-like interactions (scrolling, small pauses) on a tab.
+ * This is intentionally lightweight and randomised to avoid looking like a bot.
+ * @param {number} tabId - The ID of the tab to interact with
+ * @returns {Promise<boolean>} - Resolves to true if script executed
+ */
+async function performHumanLikeInteractions(tabId) {
+  if (!tabId || tabId < 0 || !chrome.scripting) {
+    console.warn(
+      "[Background] ⚠️ Cannot perform human-like interactions: invalid tabId or chrome.scripting not available",
+    );
+    return false;
+  }
+
+  try {
+    console.log(
+      "[Background] 👤 Performing human-like interactions on tab:",
+      tabId,
+    );
+
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      func: () => {
+        try {
+          const randomInt = (min, max) =>
+            Math.floor(Math.random() * (max - min + 1)) + min;
+
+          const totalScrolls = randomInt(3, 7);
+          let current = 0;
+
+          const doScroll = () => {
+            current += 1;
+            const amount = randomInt(300, 1000);
+            window.scrollBy(0, amount);
+
+            // Occasionally scroll up a bit
+            if (current === 2 || current === totalScrolls - 1) {
+              setTimeout(() => {
+                window.scrollBy(0, -randomInt(150, 400));
+              }, randomInt(400, 1200));
+            }
+
+            if (current < totalScrolls) {
+              setTimeout(doScroll, randomInt(600, 2200));
+            } else {
+              // Small idle delay at the end
+              setTimeout(() => {
+                window.scrollTo({ top: 0, behavior: "smooth" });
+              }, randomInt(800, 2000));
+            }
+          };
+
+          // Start after a small delay to let the page settle
+          setTimeout(doScroll, randomInt(800, 2000));
+        } catch (e) {
+          console.error(
+            "[Content] Error while performing human-like interactions:",
+            e,
+          );
+        }
+      },
+    });
+
+    // Give the in-page script some time to run before we touch the window
+    await new Promise((resolve) => setTimeout(resolve, 8000));
+
+    console.log(
+      "[Background] ✅ Human-like interactions finished (or timed out) for tab:",
+      tabId,
+    );
+    return true;
+  } catch (error) {
+    console.error(
+      "[Background] ❌ Error performing human-like interactions on tab",
+      tabId,
+      error,
+    );
+    return false;
+  }
+}
+
 async function loadConfig() {
   if (config) return config;
 
@@ -1915,104 +1996,217 @@ async function processUrlsSequentially() {
                   urlProcessed = true;
                 }
               } else if (contains200OK) {
-                // Response is 200-OK: Wait 5 minutes, then close browser, clear data, then resume from next URL
-                console.log(
-                  `[Background] ⚠️ URL ${i + 1} returned 200-OK. Setting alarm to close browser after 5 minutes, then resuming from next URL...`,
-                );
-                
-                // Send alert to popup UI with progress
-                chrome.runtime.sendMessage({
+              // Response is 200-OK:
+              // 1) Do some human-like interactions on the page
+              // 2) Close Chrome & clear data
+              // 3) Reopen Chrome
+              // 4) Retry the SAME URL (up to MAX_RETRIES_FOR_URL times)
+              urlRetryCount++;
+
+              console.log(
+                `[Background] ⚠️ URL ${i + 1} returned 200-OK. Performing human-like interactions and will retry same URL (attempt ${urlRetryCount}/${MAX_RETRIES_FOR_URL})...`,
+              );
+
+              // Send alert to popup UI with progress
+              chrome.runtime
+                .sendMessage({
                   action: "urlProcessingProgress",
                   completed: totalProcessed + i,
                   total: Math.max(totalUrlsSeen, totalProcessed + totalUrls),
-                  message: `⚠️ URL ${i + 1} returned 200-OK. Closing and reopening Chrome, then waiting 5 minutes before resuming...`,
+                  message: `⚠️ URL ${i + 1} returned 200-OK. Performing human-like interactions and will retry same URL (attempt ${urlRetryCount}/${MAX_RETRIES_FOR_URL})...`,
                   alert: true,
                   alertType: "warning",
-                }).catch(() => {});
+                })
+                .catch(() => {});
 
-                // Store context for alarm handler
-                await chrome.storage.local.set({
-                  closeChromeContext: {
-                    type: "processUrlsSequentially",
-                    urlIndex: i,
-                    url: url,
-                    totalProcessed: totalProcessed,
-                    totalUrls: totalUrls,
-                  }
-                });
+              // Perform human-like interactions on the current Makemytrip tab
+              if (currentTab && currentTab.id) {
+                await performHumanLikeInteractions(currentTab.id);
+              }
 
-                // Clear any existing alarm
-                try {
-                  await chrome.alarms.clear("closeChromeAfter200OK");
-                } catch (error) {
-                  console.warn("[Background] Could not clear existing alarm:", error);
-                }
-                
-                // Close ALL browser windows (excluding extension popup) immediately
-                await closeChromeWindowsSafely();
+              // Store context for alarm handler (backup)
+              await chrome.storage.local.set({
+                closeChromeContext: {
+                  type: "processUrlsSequentially",
+                  urlIndex: i,
+                  url: url,
+                  totalProcessed: totalProcessed,
+                  totalUrls: totalUrls,
+                },
+              });
 
-                // Clear all browser data including history
-                await clearBrowserDataSafely();
-                
-                // Reopen Chrome windows after closing
-                console.log("[Background] 🚪 Reopening Chrome window after 200-OK...");
-                await new Promise((resolve) => setTimeout(resolve, 2000)); // Wait 2 seconds before reopening
-                try {
-                  const newWindow = await chrome.windows.create({
-                    focused: true,
-                    type: "normal",
-                  });
-                  console.log(`[Background] ✅ New Chrome window opened: ${newWindow.id}`);
-                  // Wait a bit for the window to fully initialize
-                  await new Promise((resolve) => setTimeout(resolve, 2000));
-                } catch (error) {
-                  console.error("[Background] ❌ Error reopening Chrome window:", error);
-                }
-                
-                // Create alarm to wait 5 minutes (backup in case service worker suspends)
-                try {
-                  chrome.alarms.create("closeChromeAfter200OK", {
-                    delayInMinutes: 5,
-                  });
-                  console.log("[Background] ⏳ Alarm set: Waiting 5 minutes after reopening Chrome (backup)...");
-                } catch (error) {
-                  console.error("[Background] ❌ Could not create alarm:", error);
-                }
-                
-                // Wait 5 minutes after reopening Chrome
-                console.log("[Background] ⏳ Waiting 5 minutes after reopening Chrome...");
-                await new Promise((resolve) => setTimeout(resolve, PAUSE_ON_200_OK_OR_INFLIGHT));
-                
-                // Clear the alarm since we've handled it
-                await chrome.alarms.clear("closeChromeAfter200OK").catch(() => {});
-                await chrome.storage.local.remove("closeChromeContext").catch(() => {});
-                
-                console.log(
-                  `[Background] 🔄 Resuming from URL ${i + 2} (skipping URL ${i + 1} that returned 200-OK)...`,
+              // Clear any existing alarm
+              try {
+                await chrome.alarms.clear("closeChromeAfter200OK");
+              } catch (error) {
+                console.warn(
+                  "[Background] Could not clear existing alarm:",
+                  error,
                 );
-                
-                // Send alert to popup UI with progress
-                chrome.runtime.sendMessage({
-                  action: "urlProcessingProgress",
-                  completed: totalProcessed + i,
-                  total: Math.max(totalUrlsSeen, totalProcessed + totalUrls),
-                  message: `🔄 Resuming from URL ${i + 2} after 5-minute pause (skipped URL ${i + 1} with 200-OK)...`,
-                  alert: true,
-                  alertType: "info",
-                }).catch(() => {});
+              }
 
-                // Mark current URL as processed (failed due to 200-OK) and continue to next URL
-                processedUrls.push({ 
-                  url: url, 
-                  success: false, 
-                  tabId: currentTab?.id || null, 
-                  error: "200-OK response",
-                  skipped: true
+              // Close ALL browser windows (excluding extension popup) immediately
+              await closeChromeWindowsSafely();
+
+              // Clear all browser data including history
+              await clearBrowserDataSafely();
+
+              // Reopen Chrome windows after closing
+              console.log(
+                "[Background] 🚪 Reopening Chrome window after 200-OK...",
+              );
+              await new Promise((resolve) => setTimeout(resolve, 2000)); // Wait 2 seconds before reopening
+              try {
+                const newWindow = await chrome.windows.create({
+                  focused: true,
+                  type: "normal",
                 });
-                urlProcessed = true; // Mark as processed so we move to next URL in main loop
-                // Note: All windows are already closed, so we don't need to close tab again
-                currentTab = null; // Clear tab reference since windows are closed
+                console.log(
+                  `[Background] ✅ New Chrome window opened: ${newWindow.id}`,
+                );
+                // Wait a bit for the window to fully initialize
+                await new Promise((resolve) => setTimeout(resolve, 2000));
+              } catch (error) {
+                console.error(
+                  "[Background] ❌ Error reopening Chrome window:",
+                  error,
+                );
+              }
+
+              // Create alarm to wait 5 minutes (backup in case service worker suspends)
+              try {
+                chrome.alarms.create("closeChromeAfter200OK", {
+                  delayInMinutes: 5,
+                });
+                console.log(
+                  "[Background] ⏳ Alarm set: Waiting 5 minutes after reopening Chrome (backup)...",
+                );
+              } catch (error) {
+                console.error(
+                  "[Background] ❌ Could not create alarm:",
+                  error,
+                );
+              }
+
+              // Wait 5 minutes after reopening Chrome
+              console.log(
+                "[Background] ⏳ Waiting 5 minutes after reopening Chrome before retrying same URL...",
+              );
+              await new Promise((resolve) =>
+                setTimeout(resolve, PAUSE_ON_200_OK_OR_INFLIGHT),
+              );
+
+              // Clear the alarm since we've handled it
+              await chrome.alarms.clear("closeChromeAfter200OK").catch(() => {});
+              await chrome.storage.local.remove("closeChromeContext").catch(
+                () => {},
+              );
+
+              // If we've exceeded max retries, mark as failed/skip and move on
+              if (urlRetryCount >= MAX_RETRIES_FOR_URL) {
+                console.warn(
+                  `[Background] ❌ URL ${i + 1} returned 200-OK after ${MAX_RETRIES_FOR_URL} attempts. Marking as failed/skip and moving on...`,
+                );
+
+                processedUrls.push({
+                  url: url,
+                  success: false,
+                  tabId: currentTab?.id || null,
+                  error: "200-OK response after max retries",
+                  skipped: true,
+                });
+                urlProcessed = true;
+                currentTab = null;
                 break; // Exit retry loop and continue to next URL in main loop
+              }
+
+              // Otherwise, reopen the SAME URL in a fresh tab and retry within this loop
+              console.log(
+                `[Background] 🔄 Retrying same URL ${i + 1} after 200-OK, attempt ${urlRetryCount}/${MAX_RETRIES_FOR_URL}...`,
+              );
+
+              try {
+                currentTab = await new Promise((resolve, reject) => {
+                  chrome.tabs.create({ url: url, active: false }, (newTab) => {
+                    if (chrome.runtime.lastError) {
+                      reject(new Error(chrome.runtime.lastError.message));
+                    } else {
+                      resolve(newTab);
+                    }
+                  });
+                });
+
+                console.log(
+                  "[Background] Tab reopened for 200-OK retry:",
+                  currentTab.id,
+                );
+
+                // Wait for page to load
+                await new Promise((resolve) => {
+                  let resolved = false;
+                  const listener = (tabId, changeInfo, tabInfo) => {
+                    if (
+                      tabId === currentTab.id &&
+                      changeInfo.status === "complete"
+                    ) {
+                      if (!resolved) {
+                        resolved = true;
+                        chrome.tabs.onUpdated.removeListener(listener);
+                        resolve();
+                      }
+                    }
+                  };
+                  chrome.tabs.onUpdated.addListener(listener);
+
+                  setTimeout(() => {
+                    if (!resolved) {
+                      resolved = true;
+                      chrome.tabs.onUpdated.removeListener(listener);
+                      resolve();
+                    }
+                  }, 3000);
+                });
+
+                // Inject content script
+                if (currentTab && currentTab.id) {
+                  try {
+                    await chrome.scripting.executeScript({
+                      target: { tabId: currentTab.id },
+                      files: ["content.js"],
+                    });
+                    console.log(
+                      `[Background] Content script injected for 200-OK retry tab ${currentTab.id}`,
+                    );
+                  } catch (error) {
+                    console.warn(
+                      `[Background] Content script injection warning on 200-OK retry:`,
+                      error.message,
+                    );
+                  }
+                }
+
+                // Wait a bit for page to initialize before next attempt
+                await new Promise((resolve) => setTimeout(resolve, 1000));
+              } catch (error) {
+                console.error(
+                  "[Background] ❌ Error reopening tab for 200-OK retry:",
+                  error,
+                );
+                // If we fail to reopen, mark as failed and stop retrying
+                processedUrls.push({
+                  url: url,
+                  success: false,
+                  tabId: null,
+                  error: "Failed to reopen tab after 200-OK",
+                  skipped: true,
+                });
+                urlProcessed = true;
+                currentTab = null;
+                break;
+              }
+
+              // Continue the while-loop to retry with the newly opened tab
+              continue;
               } else if (isInFlight && urlRetryCount < MAX_RETRIES_FOR_URL - 1) {
                 // Response is in-flight (no data available), wait and retry
                 urlRetryCount++; // Increment for next retry attempt
