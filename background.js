@@ -540,8 +540,9 @@ async function storeResponseInCollection({
     requestUrl,
   );
 
-  const PAUSE_ON_200_OK = 5 * 60 * 1000; // 5 minutes in milliseconds
-  const MAX_RETRIES = 3; // Maximum retry attempts
+  const processingCfg = cfg.processing || {};
+  const PAUSE_ON_200_OK = processingCfg.pauseOn200Ok || 5 * 60 * 1000; // Default: 5 minutes in milliseconds
+  const MAX_RETRIES = processingCfg.maxRetriesForUrl || 3; // Default: Maximum retry attempts
   
   let retryCount = 0;
   let lastResponse = null;
@@ -1468,6 +1469,178 @@ async function clearSiteAndBrowserData() {
 }
 
 /**
+ * Extract search parameters from MakeMyTrip URL
+ * @param {string} url - The MakeMyTrip flight search URL
+ * @returns {Object|null} - Object with source, destination, departure_date, trip_type, or null if parsing fails
+ */
+function extractSearchParamsFromUrl(url) {
+  try {
+    const urlObj = new URL(url);
+    const itinerary = urlObj.searchParams.get("itinerary"); // e.g., "DEL-BLR-25/12/2024"
+    const tripTypeParam = urlObj.searchParams.get("tripType"); // "O" for oneway, "R" for round
+    
+    if (!itinerary) {
+      console.warn("[Background] Could not extract itinerary from URL:", url);
+      return null;
+    }
+
+    // Parse itinerary: "DEL-BLR-25/12/2024" or "DEL-BLR-20241225"
+    const parts = itinerary.split("-");
+    if (parts.length < 3) {
+      console.warn("[Background] Invalid itinerary format:", itinerary);
+      return null;
+    }
+
+    const source = parts[0];
+    const destination = parts[1];
+    let departureDate = parts.slice(2).join("-"); // Handle dates with slashes or dashes
+    
+    // Convert date format if needed (from DD/MM/YYYY to DD/MM/YYYY or YYYYMMDD to DD/MM/YYYY)
+    if (departureDate.includes("/")) {
+      // Already in DD/MM/YYYY format
+      departureDate = departureDate;
+    } else if (departureDate.length === 8 && /^\d+$/.test(departureDate)) {
+      // Convert YYYYMMDD to DD/MM/YYYY
+      const year = departureDate.substring(0, 4);
+      const month = departureDate.substring(4, 6);
+      const day = departureDate.substring(6, 8);
+      departureDate = `${day}/${month}/${year}`;
+    }
+
+    // Determine trip type
+    const tripType = tripTypeParam === "R" ? "round" : "oneway";
+
+    return {
+      source,
+      destination,
+      departure_date: departureDate,
+      trip_type: tripType,
+    };
+  } catch (error) {
+    console.error("[Background] Error extracting search params from URL:", error);
+    return null;
+  }
+}
+
+/**
+ * Call the MMT search API with extracted parameters
+ * @param {Object} searchParams - Object with source, destination, departure_date, trip_type
+ * @returns {Promise<Object>} - API response
+ */
+async function callMMTSearchAPI(searchParams) {
+  try {
+    const cfg = await loadConfig();
+    const searchApiCfg = cfg.searchApi || {};
+    const apiUrl = searchApiCfg.url || "https://mmt_api.mfilterit.net/search";
+    
+    const payload = {
+      source: searchParams.source,
+      destination: searchParams.destination,
+      trip_type: searchParams.trip_type,
+      departure_date: searchParams.departure_date,
+      insert_to_db: searchApiCfg.insertToDb !== undefined ? searchApiCfg.insertToDb : true,
+      is_domestic: searchApiCfg.isDomestic || "domestic",
+    };
+
+    console.log("[Background] 🔍 Calling MMT Search API with params:", payload);
+
+    const response = await fetch(apiUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify(payload),
+    });
+
+    const text = await response.text();
+    let parsedBody = null;
+    try {
+      parsedBody = text ? JSON.parse(text) : null;
+    } catch (error) {
+      parsedBody = text;
+    }
+
+    if (!response.ok) {
+      console.error("[Background] ❌ MMT Search API failed:", response.status, parsedBody);
+      return {
+        success: false,
+        status: response.status,
+        error: parsedBody,
+      };
+    }
+
+    console.log("[Background] ✅ MMT Search API response:", parsedBody);
+    return {
+      success: true,
+      data: parsedBody,
+    };
+  } catch (error) {
+    console.error("[Background] ❌ Error calling MMT Search API:", error);
+    return {
+      success: false,
+      error: error.message,
+    };
+  }
+}
+
+/**
+ * Wait with periodic search API calls during the wait period
+ * @param {number} waitTimeMs - Total wait time in milliseconds
+ * @param {Object} searchParams - Search parameters to use for API calls
+ * @param {number} intervalMs - Interval between API calls (default: 2.5 minutes)
+ * @returns {Promise<void>}
+ */
+async function waitWithSearchAPICalls(waitTimeMs, searchParams, intervalMs = 2.5 * 60 * 1000) {
+  if (!searchParams) {
+    console.warn("[Background] No search params provided, waiting without API calls");
+    await new Promise((resolve) => setTimeout(resolve, waitTimeMs));
+    return;
+  }
+
+  const startTime = Date.now();
+  const endTime = startTime + waitTimeMs;
+  let callCount = 0;
+
+  console.log(
+    `[Background] ⏳ Starting wait period of ${waitTimeMs / 1000 / 60} minutes with periodic search API calls...`,
+  );
+
+  while (Date.now() < endTime) {
+    const remainingTime = endTime - Date.now();
+    
+    // Call search API
+    callCount++;
+    console.log(`[Background] 🔍 Search API call #${callCount} during wait period...`);
+    const apiResult = await callMMTSearchAPI(searchParams);
+    
+    if (apiResult.success) {
+      console.log(
+        `[Background] ✅ Search API call #${callCount} successful:`,
+        apiResult.data?.message || "Success",
+      );
+    } else {
+      console.warn(
+        `[Background] ⚠️ Search API call #${callCount} failed:`,
+        apiResult.error || "Unknown error",
+      );
+    }
+
+    // Wait for the interval or remaining time, whichever is smaller
+    const waitInterval = Math.min(intervalMs, remainingTime);
+    if (waitInterval > 0) {
+      console.log(
+        `[Background] ⏳ Waiting ${waitInterval / 1000} seconds before next API call or end of wait period...`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, waitInterval));
+    }
+  }
+
+  console.log(
+    `[Background] ✅ Wait period completed. Made ${callCount} search API calls.`,
+  );
+}
+
+/**
  * Close and reopen Chrome windows (excluding extension popup)
  * This effectively "restarts" Chrome from the extension's perspective
  * @returns {Promise<boolean>} - Promise resolving to true if successful
@@ -1547,8 +1720,10 @@ async function closeAndReopenChrome() {
  */
 async function retryFailedUrls(failedUrls, urlsBeforeClear, delayBetweenUrls, totalProcessedSoFar = 0) {
   const retryResults = [];
-  const PAUSE_ON_200_OK = 5 * 60 * 1000; // 5 minutes in milliseconds
-  const MAX_RETRIES = 3; // Maximum retry attempts per URL (3 total: initial + 2 retries)
+  const cfg = await loadConfig();
+  const processingCfg = cfg.processing || {};
+  const PAUSE_ON_200_OK = processingCfg.pauseOn200Ok || 5 * 60 * 1000; // Default: 5 minutes in milliseconds
+  const MAX_RETRIES = processingCfg.maxRetriesForUrl || 3; // Default: Maximum retry attempts per URL (3 total: initial + 2 retries)
 
   for (let idx = 0; idx < failedUrls.length; idx++) {
     const failedUrl = failedUrls[idx];
@@ -1794,8 +1969,9 @@ async function processUrlsSequentially() {
   try {
     const cfg = await loadConfig();
     const urlsBeforeClear = cfg.urlsBeforeClear || 2;
-    const delayBetweenUrls = 5000; // 5 seconds between URLs
-    const delayBetweenBatches = 1000; // 1 second between batches (reduced from 2)
+    const processingCfg = cfg.processing || {};
+    const delayBetweenUrls = processingCfg.delayBetweenUrls || 10000; // Default: 10 seconds between URLs (after processing completes)
+    const delayBetweenBatches = processingCfg.delayBetweenBatches || 1000; // Default: 1 second between batches
 
     const allProcessedUrls = [];
     const failedUrls = []; // Track failed URLs for retry
@@ -1834,14 +2010,6 @@ async function processUrlsSequentially() {
 
       for (let i = 0; i < totalUrls; i++) {
         const url = urls[i];
-
-        // Wait before processing next URL (except for first one)
-        if (i > 0) {
-          console.log(
-            `[Background] Waiting ${delayBetweenUrls / 1000} seconds before processing next URL...`,
-          );
-          await new Promise((resolve) => setTimeout(resolve, delayBetweenUrls));
-        }
 
         try {
           // Send progress update
@@ -1916,8 +2084,9 @@ async function processUrlsSequentially() {
           await new Promise((resolve) => setTimeout(resolve, 1000)); // Reduced from 2000ms
 
           // Retry logic for 200-OK or in-flight responses
-          const PAUSE_ON_200_OK_OR_INFLIGHT = 5 * 60 * 1000; // 5 minutes in milliseconds
-          const MAX_RETRIES_FOR_URL = 3; // Maximum 3 retry attempts (initial attempt + 2 retries = 3 total attempts)
+          const processingCfg = cfg.processing || {};
+          const PAUSE_ON_200_OK_OR_INFLIGHT = processingCfg.pauseOn200OkOrInFlight || 5 * 60 * 1000; // Default: 5 minutes in milliseconds
+          const MAX_RETRIES_FOR_URL = processingCfg.maxRetriesForUrl || 3; // Default: Maximum 3 retry attempts (initial attempt + 2 retries = 3 total attempts)
           let urlRetryCount = 0; // Track retry attempts (0 = initial, 1-3 = retries)
           let urlProcessed = false;
           let currentTab = tab;
@@ -2095,12 +2264,27 @@ async function processUrlsSequentially() {
               // 1) Do some human-like interactions on the page
               // 2) Close Chrome & clear data
               // 3) Reopen Chrome
-              // 4) Retry the SAME URL (up to MAX_RETRIES_FOR_URL times)
+              // 4) During 5-minute wait, call search API with data from URL
+              // 5) After 15 minutes, call search API again and retry extension
+              // 6) Retry the SAME URL (up to MAX_RETRIES_FOR_URL times)
               urlRetryCount++;
 
               console.log(
                 `[Background] ⚠️ URL ${i + 1} returned 200-OK. Performing human-like interactions and will retry same URL (attempt ${urlRetryCount}/${MAX_RETRIES_FOR_URL})...`,
               );
+
+              // Extract search parameters from URL
+              const searchParams = extractSearchParamsFromUrl(url);
+              if (searchParams) {
+                console.log(
+                  "[Background] 📋 Extracted search params from URL:",
+                  searchParams,
+                );
+              } else {
+                console.warn(
+                  "[Background] ⚠️ Could not extract search params from URL, search API calls will be skipped",
+                );
+              }
 
               // Send alert to popup UI with progress
               chrome.runtime
@@ -2183,12 +2367,16 @@ async function processUrlsSequentially() {
                 );
               }
 
-              // Wait 5 minutes after reopening Chrome
+              // Wait after reopening Chrome, calling search API during this period
+              const firstWaitTime = PAUSE_ON_200_OK_OR_INFLIGHT;
+              const firstWaitInterval = processingCfg.searchApiCallIntervalFirstWait || 2.5 * 60 * 1000; // Default: 2.5 minutes
               console.log(
-                "[Background] ⏳ Waiting 5 minutes after reopening Chrome before retrying same URL...",
+                `[Background] ⏳ Waiting ${firstWaitTime / 1000 / 60} minutes after reopening Chrome before retrying same URL (with search API calls)...`,
               );
-              await new Promise((resolve) =>
-                setTimeout(resolve, PAUSE_ON_200_OK_OR_INFLIGHT),
+              await waitWithSearchAPICalls(
+                firstWaitTime,
+                searchParams,
+                firstWaitInterval,
               );
 
               // Clear the alarm since we've handled it
@@ -2196,6 +2384,35 @@ async function processUrlsSequentially() {
               await chrome.storage.local.remove("closeChromeContext").catch(
                 () => {},
               );
+
+              // Additional wait time after first wait (configurable)
+              const ADDITIONAL_WAIT_TIME = processingCfg.additionalWaitAfter200Ok || 10 * 60 * 1000; // Default: 10 minutes
+              const secondWaitInterval = processingCfg.searchApiCallIntervalSecondWait || 5 * 60 * 1000; // Default: 5 minutes
+              console.log(
+                `[Background] ⏳ Waiting additional ${ADDITIONAL_WAIT_TIME / 1000 / 60} minutes (total ${(firstWaitTime + ADDITIONAL_WAIT_TIME) / 1000 / 60} minutes) before final search API call and retry...`,
+              );
+              await waitWithSearchAPICalls(
+                ADDITIONAL_WAIT_TIME,
+                searchParams,
+                secondWaitInterval,
+              );
+
+              // Final search API call before retrying extension
+              if (searchParams) {
+                console.log(
+                  "[Background] 🔍 Making final search API call before retrying extension...",
+                );
+                const finalApiResult = await callMMTSearchAPI(searchParams);
+                if (finalApiResult.success) {
+                  console.log(
+                    "[Background] ✅ Final search API call successful, proceeding with extension retry...",
+                  );
+                } else {
+                  console.warn(
+                    "[Background] ⚠️ Final search API call failed, but proceeding with extension retry anyway...",
+                  );
+                }
+              }
 
               // If we've exceeded max retries, mark as failed/skip and move on
               if (urlRetryCount >= MAX_RETRIES_FOR_URL) {
@@ -2576,6 +2793,14 @@ async function processUrlsSequentially() {
               message: `Completed ${i + 1}/${totalUrls} in batch (Total processed: ${currentIndex})`,
             })
             .catch(() => {});
+
+          // Wait 15 seconds before processing next URL (except for last URL in batch)
+          if (i < totalUrls - 1) {
+            console.log(
+              `[Background] ⏳ Waiting ${delayBetweenUrls / 1000} seconds before processing next URL...`,
+            );
+            await new Promise((resolve) => setTimeout(resolve, delayBetweenUrls));
+          }
 
           // After 40 URLs processed, break from current batch and fetch next batch from API
           if (currentIndex >= 40 && currentIndex % 40 === 0) {

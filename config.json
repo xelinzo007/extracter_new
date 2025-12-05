@@ -31,5 +31,20 @@
   "scheduledHour": 6,
   "scheduledMinute": 58,
   "maxParallelTabs": 3,
-  "targetDurationMinutes": 255
+  "targetDurationMinutes": 255,
+  "processing": {
+    "delayBetweenUrls": 10000,
+    "delayBetweenBatches": 1000,
+    "maxRetriesForUrl": 3,
+    "pauseOn200Ok": 300000,
+    "pauseOn200OkOrInFlight": 300000,
+    "additionalWaitAfter200Ok": 600000,
+    "searchApiCallIntervalFirstWait": 150000,
+    "searchApiCallIntervalSecondWait": 300000
+  },
+  "searchApi": {
+    "url": "https://mmt_api.mfilterit.net/search",
+    "insertToDb": true,
+    "isDomestic": "domestic"
+  }
 }
