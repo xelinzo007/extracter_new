@@ -1553,7 +1553,7 @@ async function callMMTSearchAPI(searchParams) {
     const cfg = await loadConfig();
     const searchApiCfg = cfg.searchApi || {};
     const apiUrl = searchApiCfg.url || "https://mmt_api.mfilterit.net/search";
-    const timeoutMs = 30000; // 30 seconds timeout
+    const timeoutMs = 60000; // 60 seconds timeout
     
     const payload = {
       source: searchParams.source,
@@ -1643,20 +1643,20 @@ async function callMMTSearchAPI(searchParams) {
       
       // Check if error is due to timeout
       if (fetchError.name === 'AbortError' || fetchError.message.includes('aborted')) {
-        console.error("[Background] ❌ MMT Search API timeout after 30 seconds");
+        console.error("[Background] ❌ MMT Search API timeout after 60 seconds");
         searchApiStats.failedCalls++;
         
         chrome.runtime.sendMessage({
           action: "urlProcessingProgress",
           alert: true,
           alertType: "error",
-          message: `❌ Search API timeout after 30 seconds`,
+          message: `❌ Search API timeout after 60 seconds`,
           searchApiStats: { ...searchApiStats },
         }).catch(() => {});
         
         return {
           success: false,
-          error: "Request timeout after 30 seconds",
+          error: "Request timeout after 60 seconds",
           timeout: true,
         };
       }
