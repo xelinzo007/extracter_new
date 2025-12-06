@@ -1,7 +1,7 @@
 {
   "sectorsApi": {
     "baseUrl": "https://mmt-new.mfilterit.net/dev/api/sectors",
-    "type": "domestic_roundtrip",
+    "type": "domestic_oneway",
     "headers": {
       "x-api-key": "NITESHABCD"
     }
@@ -13,7 +13,7 @@
   },
   "insertApi": {
     "url": "https://mmt-new.mfilterit.net/dev/api/insert_resp",
-    "collectionName": "roundtrip_domestic_dump",
+    "collectionName": "one_way_domestic_dump",
     "requestHeaders": {
       "x-api-key": "NITESHABCD",
       "Content-Type": "application/json"

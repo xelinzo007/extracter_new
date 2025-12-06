@@ -10,6 +10,14 @@ let persistentWindowId = null;
 let windowSizeEnforcer = null; // Store the size enforcement function
 let windowSizeCheckInterval = null; // Store the interval for size checking
 
+// Track search API statistics
+let searchApiStats = {
+  totalCalls: 0,
+  successfulCalls: 0,
+  totalRecordsInserted: 0,
+  failedCalls: 0,
+};
+
 /**
  * Helper function to safely close Chrome windows (excluding extension popup)
  */
@@ -1475,25 +1483,33 @@ async function clearSiteAndBrowserData() {
  */
 function extractSearchParamsFromUrl(url) {
   try {
+    console.log("[Background] 🔍 Attempting to extract search params from URL:", url);
     const urlObj = new URL(url);
     const itinerary = urlObj.searchParams.get("itinerary"); // e.g., "DEL-BLR-25/12/2024"
     const tripTypeParam = urlObj.searchParams.get("tripType"); // "O" for oneway, "R" for round
     
+    console.log("[Background] 📋 Extracted from URL - itinerary:", itinerary, "tripType:", tripTypeParam);
+    
     if (!itinerary) {
-      console.warn("[Background] Could not extract itinerary from URL:", url);
+      console.error("[Background] ❌ Could not extract itinerary from URL:", url);
+      console.error("[Background] ❌ URL search params:", urlObj.searchParams.toString());
       return null;
     }
 
     // Parse itinerary: "DEL-BLR-25/12/2024" or "DEL-BLR-20241225"
     const parts = itinerary.split("-");
+    console.log("[Background] 📋 Itinerary parts:", parts);
+    
     if (parts.length < 3) {
-      console.warn("[Background] Invalid itinerary format:", itinerary);
+      console.error("[Background] ❌ Invalid itinerary format:", itinerary, "parts:", parts.length);
       return null;
     }
 
     const source = parts[0];
     const destination = parts[1];
     let departureDate = parts.slice(2).join("-"); // Handle dates with slashes or dashes
+    
+    console.log("[Background] 📋 Parsed - source:", source, "destination:", destination, "raw date:", departureDate);
     
     // Convert date format if needed (from DD/MM/YYYY to DD/MM/YYYY or YYYYMMDD to DD/MM/YYYY)
     if (departureDate.includes("/")) {
@@ -1505,19 +1521,24 @@ function extractSearchParamsFromUrl(url) {
       const month = departureDate.substring(4, 6);
       const day = departureDate.substring(6, 8);
       departureDate = `${day}/${month}/${year}`;
+      console.log("[Background] 📋 Converted date from YYYYMMDD to DD/MM/YYYY:", departureDate);
     }
 
     // Determine trip type
     const tripType = tripTypeParam === "R" ? "round" : "oneway";
 
-    return {
+    const result = {
       source,
       destination,
       departure_date: departureDate,
       trip_type: tripType,
     };
+    
+    console.log("[Background] ✅ Successfully extracted search params:", result);
+    return result;
   } catch (error) {
-    console.error("[Background] Error extracting search params from URL:", error);
+    console.error("[Background] ❌ Error extracting search params from URL:", error);
+    console.error("[Background] ❌ URL that failed:", url);
     return null;
   }
 }
@@ -1532,6 +1553,7 @@ async function callMMTSearchAPI(searchParams) {
     const cfg = await loadConfig();
     const searchApiCfg = cfg.searchApi || {};
     const apiUrl = searchApiCfg.url || "https://mmt_api.mfilterit.net/search";
+    const timeoutMs = 30000; // 30 seconds timeout
     
     const payload = {
       source: searchParams.source,
@@ -1543,25 +1565,48 @@ async function callMMTSearchAPI(searchParams) {
     };
 
     console.log("[Background] 🔍 Calling MMT Search API with params:", payload);
+    console.log(`[Background] ⏱️ Timeout set to ${timeoutMs / 1000} seconds`);
+    searchApiStats.totalCalls++;
 
-    const response = await fetch(apiUrl, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify(payload),
-    });
+    // Create AbortController for timeout
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => {
+      controller.abort();
+    }, timeoutMs);
 
-    const text = await response.text();
-    let parsedBody = null;
     try {
-      parsedBody = text ? JSON.parse(text) : null;
-    } catch (error) {
-      parsedBody = text;
-    }
+      const response = await fetch(apiUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
 
-    if (!response.ok) {
+      clearTimeout(timeoutId); // Clear timeout if request completes
+
+        const text = await response.text();
+      let parsedBody = null;
+      try {
+        parsedBody = text ? JSON.parse(text) : null;
+      } catch (error) {
+        parsedBody = text;
+      }
+
+      if (!response.ok) {
       console.error("[Background] ❌ MMT Search API failed:", response.status, parsedBody);
+      searchApiStats.failedCalls++;
+      
+      // Send alert for failed API call
+      chrome.runtime.sendMessage({
+        action: "urlProcessingProgress",
+        alert: true,
+        alertType: "error",
+        message: `❌ Search API call failed: ${response.status}`,
+        searchApiStats: { ...searchApiStats },
+      }).catch(() => {});
+      
       return {
         success: false,
         status: response.status,
@@ -1569,16 +1614,72 @@ async function callMMTSearchAPI(searchParams) {
       };
     }
 
+    // Extract records inserted from response
+    const recordsInserted = parsedBody?.records_inserted || 0;
+    searchApiStats.successfulCalls++;
+    searchApiStats.totalRecordsInserted += recordsInserted;
+
     console.log("[Background] ✅ MMT Search API response:", parsedBody);
-    return {
-      success: true,
-      data: parsedBody,
-    };
+    console.log(
+      `[Background] 📊 Search API Stats: ${searchApiStats.successfulCalls} successful, ${recordsInserted} records inserted (Total: ${searchApiStats.totalRecordsInserted})`,
+    );
+
+    // Send alert for successful API call with insertion count
+    chrome.runtime.sendMessage({
+      action: "urlProcessingProgress",
+      alert: true,
+      alertType: "success",
+      message: `✅ Search API: ${recordsInserted} record(s) inserted (Total: ${searchApiStats.totalRecordsInserted})`,
+      searchApiStats: { ...searchApiStats },
+    }).catch(() => {});
+
+        return {
+          success: true,
+          data: parsedBody,
+          recordsInserted: recordsInserted,
+        };
+      } catch (fetchError) {
+      clearTimeout(timeoutId); // Clear timeout on error
+      
+      // Check if error is due to timeout
+      if (fetchError.name === 'AbortError' || fetchError.message.includes('aborted')) {
+        console.error("[Background] ❌ MMT Search API timeout after 30 seconds");
+        searchApiStats.failedCalls++;
+        
+        chrome.runtime.sendMessage({
+          action: "urlProcessingProgress",
+          alert: true,
+          alertType: "error",
+          message: `❌ Search API timeout after 30 seconds`,
+          searchApiStats: { ...searchApiStats },
+        }).catch(() => {});
+        
+        return {
+          success: false,
+          error: "Request timeout after 30 seconds",
+          timeout: true,
+        };
+      }
+      
+      throw fetchError; // Re-throw if not a timeout
+    }
   } catch (error) {
     console.error("[Background] ❌ Error calling MMT Search API:", error);
+    searchApiStats.failedCalls++;
+    
+    // Send alert for error
+    const errorMessage = error.message || "Unknown error";
+    chrome.runtime.sendMessage({
+      action: "urlProcessingProgress",
+      alert: true,
+      alertType: "error",
+      message: `❌ Search API error: ${errorMessage}`,
+      searchApiStats: { ...searchApiStats },
+    }).catch(() => {});
+    
     return {
       success: false,
-      error: error.message,
+      error: errorMessage,
     };
   }
 }
@@ -1592,7 +1693,8 @@ async function callMMTSearchAPI(searchParams) {
  */
 async function waitWithSearchAPICalls(waitTimeMs, searchParams, intervalMs = 2.5 * 60 * 1000) {
   if (!searchParams) {
-    console.warn("[Background] No search params provided, waiting without API calls");
+    console.error("[Background] ❌ No search params provided, cannot call search API during wait period");
+    console.error("[Background] ⏳ Waiting without API calls for", waitTimeMs / 1000 / 60, "minutes");
     await new Promise((resolve) => setTimeout(resolve, waitTimeMs));
     return;
   }
@@ -1604,15 +1706,25 @@ async function waitWithSearchAPICalls(waitTimeMs, searchParams, intervalMs = 2.5
   console.log(
     `[Background] ⏳ Starting wait period of ${waitTimeMs / 1000 / 60} minutes with periodic search API calls...`,
   );
+  console.log(
+    `[Background] 📋 Search params: source=${searchParams.source}, destination=${searchParams.destination}, date=${searchParams.departure_date}, trip=${searchParams.trip_type}`,
+  );
+  console.log(
+    `[Background] ⏱️ Will call API every ${intervalMs / 1000 / 60} minutes`,
+  );
 
-  while (Date.now() < endTime) {
-    const remainingTime = endTime - Date.now();
-    
-    // Call search API
-    callCount++;
-    console.log(`[Background] 🔍 Search API call #${callCount} during wait period...`);
+  // Send initial progress update
+  chrome.runtime.sendMessage({
+    action: "urlProcessingProgress",
+    message: `🔍 Starting search API calls during wait period...`,
+    searchApiStats: { ...searchApiStats },
+  }).catch(() => {});
+
+  // Make first API call immediately
+  callCount++;
+  console.log(`[Background] 🔍 Search API call #${callCount} during wait period (immediate call)...`);
+  try {
     const apiResult = await callMMTSearchAPI(searchParams);
-    
     if (apiResult.success) {
       console.log(
         `[Background] ✅ Search API call #${callCount} successful:`,
@@ -1624,7 +1736,17 @@ async function waitWithSearchAPICalls(waitTimeMs, searchParams, intervalMs = 2.5
         apiResult.error || "Unknown error",
       );
     }
+  } catch (error) {
+    console.error(
+      `[Background] ❌ Error in search API call #${callCount}:`,
+      error,
+    );
+  }
 
+  // Then continue with periodic calls
+  while (Date.now() < endTime) {
+    const remainingTime = endTime - Date.now();
+    
     // Wait for the interval or remaining time, whichever is smaller
     const waitInterval = Math.min(intervalMs, remainingTime);
     if (waitInterval > 0) {
@@ -1633,11 +1755,43 @@ async function waitWithSearchAPICalls(waitTimeMs, searchParams, intervalMs = 2.5
       );
       await new Promise((resolve) => setTimeout(resolve, waitInterval));
     }
+
+    // Check if we still have time before making another call
+    if (Date.now() < endTime) {
+      callCount++;
+      console.log(`[Background] 🔍 Search API call #${callCount} during wait period...`);
+      try {
+        const apiResult = await callMMTSearchAPI(searchParams);
+        if (apiResult.success) {
+          console.log(
+            `[Background] ✅ Search API call #${callCount} successful:`,
+            apiResult.data?.message || "Success",
+          );
+        } else {
+          console.warn(
+            `[Background] ⚠️ Search API call #${callCount} failed:`,
+            apiResult.error || "Unknown error",
+          );
+        }
+      } catch (error) {
+        console.error(
+          `[Background] ❌ Error in search API call #${callCount}:`,
+          error,
+        );
+      }
+    }
   }
 
   console.log(
     `[Background] ✅ Wait period completed. Made ${callCount} search API calls.`,
   );
+
+  // Send final progress update
+  chrome.runtime.sendMessage({
+    action: "urlProcessingProgress",
+    message: `✅ Wait period completed. Made ${callCount} search API calls. Total records inserted: ${searchApiStats.totalRecordsInserted}`,
+    searchApiStats: { ...searchApiStats },
+  }).catch(() => {});
 }
 
 /**
@@ -1962,6 +2116,14 @@ async function processUrlsSequentially() {
     };
   }
 
+  // Reset search API stats when starting new processing
+  searchApiStats = {
+    totalCalls: 0,
+    successfulCalls: 0,
+    totalRecordsInserted: 0,
+    failedCalls: 0,
+  };
+
   // Set flag to prevent concurrent execution
   isProcessingUrls = true;
   console.log("[Background] 🔒 URL processing started. Lock acquired.");
@@ -2280,9 +2442,16 @@ async function processUrlsSequentially() {
                   "[Background] 📋 Extracted search params from URL:",
                   searchParams,
                 );
+                console.log(
+                  "[Background] ✅ Search API will be called during wait periods with these params",
+                );
               } else {
-                console.warn(
-                  "[Background] ⚠️ Could not extract search params from URL, search API calls will be skipped",
+                console.error(
+                  "[Background] ❌ Could not extract search params from URL:",
+                  url,
+                );
+                console.error(
+                  "[Background] ⚠️ Search API calls will be skipped during wait periods",
                 );
               }
 
@@ -2373,6 +2542,9 @@ async function processUrlsSequentially() {
               console.log(
                 `[Background] ⏳ Waiting ${firstWaitTime / 1000 / 60} minutes after reopening Chrome before retrying same URL (with search API calls)...`,
               );
+              console.log(
+                `[Background] 🔍 Search params available: ${searchParams ? 'YES' : 'NO'}, will call API every ${firstWaitInterval / 1000 / 60} minutes`,
+              );
               await waitWithSearchAPICalls(
                 firstWaitTime,
                 searchParams,
@@ -2390,6 +2562,9 @@ async function processUrlsSequentially() {
               const secondWaitInterval = processingCfg.searchApiCallIntervalSecondWait || 5 * 60 * 1000; // Default: 5 minutes
               console.log(
                 `[Background] ⏳ Waiting additional ${ADDITIONAL_WAIT_TIME / 1000 / 60} minutes (total ${(firstWaitTime + ADDITIONAL_WAIT_TIME) / 1000 / 60} minutes) before final search API call and retry...`,
+              );
+              console.log(
+                `[Background] 🔍 Search params available: ${searchParams ? 'YES' : 'NO'}, will call API every ${secondWaitInterval / 1000 / 60} minutes`,
               );
               await waitWithSearchAPICalls(
                 ADDITIONAL_WAIT_TIME,
@@ -2526,6 +2701,19 @@ async function processUrlsSequentially() {
                 console.log(
                   `[Background] ⚠️ URL ${i + 1} is in-flight (no data available). Pausing for 5 minutes before retry (attempt ${retryAttempt}/${MAX_RETRIES_FOR_URL})...`,
                 );
+
+                // Extract search parameters from URL
+                const searchParams = extractSearchParamsFromUrl(url);
+                if (searchParams) {
+                  console.log(
+                    "[Background] 📋 Extracted search params from URL for in-flight case:",
+                    searchParams,
+                  );
+                } else {
+                  console.warn(
+                    "[Background] ⚠️ Could not extract search params from URL, search API calls will be skipped",
+                  );
+                }
                 
                 // Send alert to popup UI with progress
                 chrome.runtime.sendMessage({
@@ -2546,8 +2734,37 @@ async function processUrlsSequentially() {
                   }
                 }
 
-                // Wait 5 minutes
-                await new Promise((resolve) => setTimeout(resolve, PAUSE_ON_200_OK_OR_INFLIGHT));
+                // Wait 5 minutes with search API calls during this period
+                const inFlightWaitTime = PAUSE_ON_200_OK_OR_INFLIGHT;
+                const inFlightWaitInterval = processingCfg.searchApiCallIntervalFirstWait || 2.5 * 60 * 1000; // Default: 2.5 minutes
+                console.log(
+                  `[Background] ⏳ Waiting ${inFlightWaitTime / 1000 / 60} minutes for in-flight case (with search API calls)...`,
+                );
+                console.log(
+                  `[Background] 🔍 Search params available: ${searchParams ? 'YES' : 'NO'}, will call API every ${inFlightWaitInterval / 1000 / 60} minutes`,
+                );
+                await waitWithSearchAPICalls(
+                  inFlightWaitTime,
+                  searchParams,
+                  inFlightWaitInterval,
+                );
+
+                // Final search API call before retrying
+                if (searchParams) {
+                  console.log(
+                    "[Background] 🔍 Making final search API call before retrying in-flight URL...",
+                  );
+                  const finalApiResult = await callMMTSearchAPI(searchParams);
+                  if (finalApiResult.success) {
+                    console.log(
+                      "[Background] ✅ Final search API call successful, proceeding with retry...",
+                    );
+                  } else {
+                    console.warn(
+                      "[Background] ⚠️ Final search API call failed, but proceeding with retry anyway...",
+                    );
+                  }
+                }
                 
                 console.log(
                   `[Background] 🔄 Retrying URL ${i + 1} after 5-minute pause (attempt ${retryAttempt}/${MAX_RETRIES_FOR_URL})...`,
@@ -2561,6 +2778,7 @@ async function processUrlsSequentially() {
                   message: `🔄 Retrying URL ${i + 1} after 5-minute pause (attempt ${retryAttempt}/${MAX_RETRIES_FOR_URL})...`,
                   alert: true,
                   alertType: "info",
+                  searchApiStats: { ...searchApiStats },
                 }).catch(() => {});
 
                 // Reopen the tab for retry

@@ -28,6 +28,12 @@ document.addEventListener('DOMContentLoaded', () => {
   let completedCombinations = 0;
   let processingStartTime = null;
   let timerInterval = null;
+  let searchApiStats = {
+    totalCalls: 0,
+    successfulCalls: 0,
+    totalRecordsInserted: 0,
+    failedCalls: 0,
+  };
   
   // Single button handler - Process URLs from Config
   if (processUrlsBtn) {
@@ -116,16 +122,31 @@ document.addEventListener('DOMContentLoaded', () => {
       const currentUrl = request.currentUrl || '';
       const message = request.message || '';
       
+      // Update search API stats if provided
+      if (request.searchApiStats) {
+        searchApiStats = { ...request.searchApiStats };
+      }
+      
       // Show alert if requested
       if (request.alert && request.message) {
         const alertType = request.alertType || 'info';
         showAlert(request.message, alertType);
       }
       
-      updateProgress(completedCombinations, totalCombinations, message);
+      // Build progress message with search API stats
+      let progressMessage = message;
+      if (searchApiStats.totalCalls > 0) {
+        const apiStatsText = `🔍 Search API: ${searchApiStats.totalRecordsInserted} records inserted (${searchApiStats.successfulCalls}/${searchApiStats.totalCalls} calls)`;
+        progressMessage = message ? `${message} | ${apiStatsText}` : apiStatsText;
+      }
+      
+      updateProgress(completedCombinations, totalCombinations, progressMessage);
       
       if (completedCombinations >= totalCombinations) {
-        updateStatus(`✅ Completed processing ${totalCombinations} URLs. All files downloaded.`, 'success');
+        const finalMessage = searchApiStats.totalRecordsInserted > 0
+          ? `✅ Completed processing ${totalCombinations} URLs. ${searchApiStats.totalRecordsInserted} records inserted via Search API.`
+          : `✅ Completed processing ${totalCombinations} URLs. All files downloaded.`;
+        updateStatus(finalMessage, 'success');
         if (processUrlsBtn) {
           processUrlsBtn.disabled = false;
         }
@@ -143,6 +164,13 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   async function startProcessing() {
+    // Reset search API stats when starting new processing
+    searchApiStats = {
+      totalCalls: 0,
+      successfulCalls: 0,
+      totalRecordsInserted: 0,
+      failedCalls: 0,
+    };
     try {
       updateStatus('Starting to process URLs from config.json...', 'loading');
       if (processUrlsBtn) {
@@ -261,11 +289,17 @@ document.addEventListener('DOMContentLoaded', () => {
     
     if (details) {
       progressDetails.textContent = details;
+    } else if (searchApiStats.totalCalls > 0) {
+      // Show search API stats if available
+      progressDetails.textContent = `🔍 Search API: ${searchApiStats.totalRecordsInserted} records inserted (${searchApiStats.successfulCalls}/${searchApiStats.totalCalls} calls)`;
     }
     
     if (completed >= total && total > 0) {
       progressText.textContent = 'Completed!';
-      progressDetails.textContent = `All ${total} combinations processed successfully`;
+      const completionMessage = searchApiStats.totalRecordsInserted > 0
+        ? `All ${total} combinations processed. ${searchApiStats.totalRecordsInserted} records inserted via Search API.`
+        : `All ${total} combinations processed successfully`;
+      progressDetails.textContent = completionMessage;
       updateStatus(`All ${total} route-date combinations completed!`, 'success');
       stopElapsedTimer();
     } else {
